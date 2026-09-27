@@ -17,7 +17,6 @@ from torch.nn import functional as F
 
 from torch.profiler import record_function
 from contextlib import contextmanager, ExitStack
-from torch.profiler import record_function
 
 TRACE_TORCH = True   # PyTorch Profiler용
 TRACE_NVTX = True    # Nsight Systems/Compute용
@@ -67,14 +66,14 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, layer):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # QKV projection
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        with trace_region("ATTN_QKV_PROJ"):
+        with trace_region(f"ATTN_QKV_PROJ_{layer:02d}"):
             q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        with trace_region("ATTN_RESHAPE_QKV"):
+        with trace_region(f"ATTN_RESHAPE_QKV_{layer:02d}"):
             k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -82,33 +81,33 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            with trace_region("ATTN_SDPA"):
+            with trace_region(f"ATTN_SDPA_{layer:02d}"):
                 y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
-            with trace_region("ATTN_QK"):
+            with trace_region(f"ATTN_QK_{layer:02d}"):
                 att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
 
-            with trace_region("ATTN_MASK"):
+            with trace_region(f"ATTN_MASK_{layer:02d}"):
                 att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
 
-            with trace_region("ATTN_SOFTMAX"):
+            with trace_region(f"ATTN_SOFTMAX_{layer:02d}"):
                 att = F.softmax(att, dim=-1)
 
-            with trace_region("ATTN_DROPOUT"):
+            with trace_region(f"ATTN_DROPOUT_{layer:02d}"):
                 att = self.attn_dropout(att)
 
-            with trace_region("ATTN_AV"): 
+            with trace_region(f"ATTN_AV_{layer:02d}"): 
                 y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
 
-        with trace_region("ATTN_MERGE_HEADS"):
+        with trace_region(f"ATTN_MERGE_HEADS_{layer:02d}"):
             y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
-        with trace_region("ATTN_OUT_PROJ"):
+        with trace_region(f"ATTN_OUT_PROJ_{layer:02d}"):
             y = self.c_proj(y)
 
-        with trace_region("ATTN_RESID_DROPOUT"):
+        with trace_region(f"ATTN_RESID_DROPOUT_{layer:02d}"):
             y = self.resid_dropout(y)
         
         return y
@@ -122,35 +121,47 @@ class MLP(nn.Module):
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x):
-        with trace_region("MLP_UP_PROJ"):
+    def forward(self, x, layer):
+        with trace_region(f"MLP_UP_PROJ_{layer:02d}"):
             x = self.c_fc(x)
-        with trace_region("MLP_GELU"):
+        with trace_region(f"MLP_GELU_{layer:02d}"):
             x = self.gelu(x)
-        with trace_region("MLP_DOWN_PROJ"):
+        with trace_region(f"MLP_DOWN_PROJ_{layer:02d}"):
             x = self.c_proj(x)
-        with trace_region("MLP_DROPOUT"):
+        with trace_region(f"MLP_DROPOUT_{layer:02d}"):
             x = self.dropout(x)
         return x
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_id):
         super().__init__()
-        with trace_region("BLOCK_LN1"):
-            self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        with trace_region("BLOCK_ATTENTION"):
-            self.attn = CausalSelfAttention(config)
-        with trace_region("BLOCK_LN2"):
-            self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        with trace_region("BLOCK_MLP"):
-            self.mlp = MLP(config)
 
-    def forward(self, x):
-        with trace_region("BLOCK_RESIDUAL1"):
-            x = x + self.attn(self.ln_1(x))
-        with trace_region("BLOCK_RESIDUAL2"):
-            x = x + self.mlp(self.ln_2(x))
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
+
+    def forward(self, x, layer):
+        with trace_region(f"BLOCK_LN1_{layer:02d}"):
+            ln1_out = self.ln_1(x)
+
+        with trace_region(f"BLOCK_ATTENTION_{layer:02d}"):
+            attn_out = self.attn(ln1_out, layer)
+
+        with trace_region(f"BLOCK_RESIDUAL1_{layer:02d}"):
+            x = x + attn_out
+
+        with trace_region(f"BLOCK_LN2_{layer:02d}"):
+            ln2_out = self.ln_2(x)
+
+        with trace_region(f"BLOCK_MLP_{layer:02d}"):
+            mlp_out = self.mlp(ln2_out, layer)
+
+        with trace_region(f"BLOCK_RESIDUAL2_{layer:02d}"):
+            x = x + mlp_out
+
         return x
 
 @dataclass
@@ -175,7 +186,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -231,7 +242,7 @@ class GPT(nn.Module):
         with trace_region("GPT_BLOCKS"):
             for layer_id, block in enumerate(self.transformer.h):
                 with trace_region(f"LAYER_{layer_id:02d}"):
-                    x = block(x)
+                    x = block(x, layer_id)
 
         with trace_region("GPT_FINAL_LN"):
             x = self.transformer.ln_f(x)
@@ -374,14 +385,14 @@ class GPT(nn.Module):
             # pluck the logits at the final step and scale by desired temperature
             with trace_region("GEN_SAMPLE"):
                 logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
+                # optionally crop the logits to only the top k options
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = F.softmax(logits, dim=-1)
+                # sample from the distribution
+                idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
 
             with trace_region("GEN_APPEND_TOKEN"):
