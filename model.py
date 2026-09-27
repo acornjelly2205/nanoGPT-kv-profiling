@@ -16,6 +16,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from torch.profiler import record_function
+from contextlib import contextmanager, ExitStack
+from torch.profiler import record_function
 
 TRACE_TORCH = True   # PyTorch Profiler용
 TRACE_NVTX = True    # Nsight Systems/Compute용
