@@ -15,6 +15,23 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from contextlib import contextmanager, ExitStack
+from torch.profiler import record_function
+
+TRACE_TORCH = True   # PyTorch Profiler용
+TRACE_NVTX = True    # Nsight Systems/Compute용
+
+@contextmanager
+def trace_region(name):
+    with ExitStack() as stack:
+        if TRACE_TORCH:
+            stack.enter_context(record_function(name))
+
+        if TRACE_NVTX and torch.cuda.is_available():
+            stack.enter_context(torch.cuda.nvtx.range(name))
+
+        yield
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -53,8 +70,10 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, kv_cache=None, cache_index = 0):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
+        # QKV projection
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        with trace_region("ATTN_QKV_PROJ"):
+            q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         # print("out shape:", out.shape, "q shape:", q.shape, "k shape:", k.shape, "v shape:", v.shape)
 
         # print("out == q 시작주소:", out.data_ptr() == q.data_ptr())
@@ -62,31 +81,42 @@ class CausalSelfAttention(nn.Module):
         # print("v - k 바이트차:", v.data_ptr() - k.data_ptr())
         # print("out 총 바이트:", out.numel() * out.element_size())
 
+        with trace_region("ATTN_RESHAPE_QKV"):
         # print("split 직후 k: ", k.shape)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        # print("head 분할 후 k: ", k.shape, k.stride(), k.is_contiguous())
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            # print("head 분할 후 k: ", k.shape, k.stride(), k.is_contiguous())
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         if kv_cache is not None:
-             # kv_cache: [2, B, n_head, max_T, hs]
-            kv_cache[0, :, :, cache_index:cache_index+T, :] = k
-            kv_cache[1, :, :, cache_index:cache_index+T, :] = v
-            k = kv_cache[0, :, :, :cache_index+T]
-            v = kv_cache[1, :, :, :cache_index+T] 
+            with trace_region("ATTN_KV_CACHE_UPDATE"):
+                # kv_cache: [2, B, n_head, max_T, hs]
+                kv_cache[0, :, :, cache_index:cache_index+T, :] = k
+                kv_cache[1, :, :, cache_index:cache_index+T, :] = v
+                k = kv_cache[0, :, :, :cache_index+T]
+                v = kv_cache[1, :, :, :cache_index+T] 
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=(T > 1))
+            with trace_region("ATTN_SDPA"):
+                y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=(T > 1))
         else:
             # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+            with trace_region("ATTN_QK"):
+                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            with trace_region("ATTN_MASK"):
+                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            with trace_region("ATTN_SOFTMAX"):
+                att = F.softmax(att, dim=-1)
+            with trace_region("ATTN_DROPOUT"):
+                att = self.attn_dropout(att)
+            with trace_region("ATTN_AV"):
+                y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+
+        with trace_region("ATTN_MERGE_HEADS"):
+            y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # print("transpose 전:", y.shape, y.stride(), y.is_contiguous(), y.data_ptr())
         # y_t = y.transpose(1, 2)
         # print("transpose 후:", y_t.shape, y_t.stride(), y_t.is_contiguous(), y_t.data_ptr())
@@ -94,10 +124,11 @@ class CausalSelfAttention(nn.Module):
         # print("contiguous 후:", y_c.shape, y_c.stride(), y_c.is_contiguous(), y_c.data_ptr())
         # y = y_c.view(B, T, C)
 
-
-
         # output projection
-        y = self.resid_dropout(self.c_proj(y))
+        with trace_region("ATTN_OUT_PROJ"):
+            y = self.c_proj(y)
+        with trace_region("ATTN_RESID_DROPOUT"):
+            y = self.resid_dropout(y)
         return y
 
 class MLP(nn.Module):
@@ -110,24 +141,34 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
+        with trace_region("MLP_UP_PROJ"):
+            x = self.c_fc(x)
+        with trace_region("MLP_GELU"):
+            x = self.gelu(x)
+        with trace_region("MLP_DOWN_PROJ"):
+            x = self.c_proj(x)
+        with trace_region("MLP_DROPOUT"):
+            x = self.dropout(x)
         return x
 
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        with trace_region("BLOCK_LN1"):
+            self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        with trace_region("BLOCK_ATTENTION"):
+            self.attn = CausalSelfAttention(config)
+        with trace_region("BLOCK_LN2"):
+            self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        with trace_region("BLOCK_MLP"):
+            self.mlp = MLP(config)
 
     def forward(self, x, kv_cache=None, cache_index=0):
-        x = x + self.attn(self.ln_1(x), kv_cache=kv_cache, cache_index=cache_index)
-        x = x + self.mlp(self.ln_2(x))
+        with trace_region("BLOCK_RESIDUAL1"):
+            x = x + self.attn(self.ln_1(x), kv_cache=kv_cache, cache_index=cache_index)
+        with trace_region("BLOCK_RESIDUAL2"):
+            x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -199,27 +240,34 @@ class GPT(nn.Module):
         pos = torch.arange(cache_index, cache_index + t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        with trace_region("GPT_TOKEN_EMBED"):
+            tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        with trace_region("GPT_POSITION_EMBED"):
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        with trace_region("GPT_EMBED_ADD_DROPOUT"):
+            x = self.transformer.drop(tok_emb + pos_emb)
         # print("embedding 직후: ", x.shape)
 
-        for i, block in enumerate(self.transformer.h):
-            layer_cache = kv_cache[i] if kv_cache is not None else None
-            x = block(x, layer_cache, cache_index)
-        x = self.transformer.ln_f(x)
+        with trace_region("GPT_BLOCKS"):
+            for i, block in enumerate(self.transformer.h):
+                with trace_region(f"LAYER_{i:02d}"):
+                    layer_cache = kv_cache[i] if kv_cache is not None else None
+                    x = block(x, layer_cache, cache_index)
+        with trace_region("GPT_FINAL_LN"):
+            x = self.transformer.ln_f(x)
         # print("12 layer 통과 후: ", x.shape)
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            # logits = self.lm_head(x)
-            # print("lm_head 출력: ", logits.shape)
-            loss = None
+        with trace_region("GPT_LM_HEAD"):
+            if targets is not None:
+                # if we are given some desired targets also calculate the loss
+                logits = self.lm_head(x)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            else:
+                # inference-time mini-optimization: only forward the lm_head on the very last position
+                logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+                # logits = self.lm_head(x)
+                # print("lm_head 출력: ", logits.shape)
+                loss = None
 
         return logits, loss
 
@@ -365,3 +413,45 @@ class GPT(nn.Module):
             cache_index += 1
 
         return idx
+
+    @torch.no_grad()
+    def generate_lab(self, idx, max_new_tokens, temperature=1.0, top_k=None,
+                    cache_len=None, greedy_fastpath=False):
+        """model.py를 건드리지 않는 측정용 드라이버. 원본 generate와 다른 점:
+        마지막 반복의 forward 생략 / zeros->empty / dtype 추론 / 스위치 2개."""
+        cfg = self.config
+        b, t0 = idx.size()
+        need = t0 + max_new_tokens
+        assert need <= cfg.block_size, f"{need} > block_size({cfg.block_size})"
+    
+        cache_len = cache_len or cfg.block_size
+        assert need <= cache_len <= cfg.block_size
+    
+        kv = torch.empty(cfg.n_layer, 2, b, cfg.n_head, cache_len,
+                        cfg.n_embd // cfg.n_head,
+                        dtype=next(self.parameters()).dtype, device=idx.device)
+
+        with trace_region("GEN_PREFILL"):
+            logits, _ = self(idx, kv_cache=kv, cache_index=0)
+        ci = t0
+        for i in range(max_new_tokens):
+            with trace_region("GEN_SAMPLE"):
+                last = logits[:, -1, :]
+                if greedy_fastpath and top_k == 1:
+                    idx_next = last.argmax(dim=-1, keepdim=True)      # 커널 1개
+                else:
+                    last = last / temperature
+                    if top_k is not None:
+                        v, _ = torch.topk(last, min(top_k, last.size(-1)))
+                        last = last.masked_fill(last < v[:, [-1]], -float('Inf'))
+                    idx_next = torch.multinomial(F.softmax(last, dim=-1), num_samples=1)
+            
+            with trace_region("GEN_APPEND_TOKEN"):
+               idx = torch.cat((idx, idx_next), dim=1)
+
+            if i < max_new_tokens - 1:
+                with trace_region("GEN_DECODE_STEP"):
+                    logits, _ = self(idx_next, kv_cache=kv, cache_index=ci)
+                ci += 1
+        return idx
+ 

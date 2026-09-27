@@ -15,6 +15,22 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from torch.profiler import record_function
+
+TRACE_TORCH = True   # PyTorch Profiler용
+TRACE_NVTX = True    # Nsight Systems/Compute용
+
+@contextmanager
+def trace_region(name):
+    with ExitStack() as stack:
+        if TRACE_TORCH:
+            stack.enter_context(record_function(name))
+
+        if TRACE_NVTX and torch.cuda.is_available():
+            stack.enter_context(torch.cuda.nvtx.range(name))
+
+        yield
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -52,27 +68,47 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
+        # QKV projection
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        with trace_region("ATTN_ZKV_PROJ"):
+            q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        with trace_region("ATTN_RESHAPE_QKV"):
+            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            with trace_region("ATTN_SDPA"):
+                y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+            with trace_region("ATTN_QK"):
+                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+
+            with trace_region("ATTN_MASK"):
+                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+
+            with trace_region("ATTN_SOFTMAX"):
+                att = F.softmax(att, dim=-1)
+
+            with trace_region("ATTN_DROPOUT"):
+                att = self.attn_dropout(att)
+
+            with trace_region("ATTN_AV"): 
+                y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        with trace_region("ATTN_MERGE_HEADS"):
+            y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
-        y = self.resid_dropout(self.c_proj(y))
+        with trace_region("ATTN_OUT_PROJ"):
+            y = self.c_proj(y)
+
+        with trace_region("ATTN_RESID_DROPOUT"):
+            y = self.resid_dropout(y)
+        
         return y
 
 class MLP(nn.Module):
@@ -85,24 +121,34 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
+        with trace_region("MLP_UP_PROJ"):
+            x = self.c_fc(x)
+        with trace_region("MLP_GELU"):
+            x = self.gelu(x)
+        with trace_region("MLP_DOWN_PROJ"):
+            x = self.c_proj(x)
+        with trace_region("MLP_DROPOUT"):
+            x = self.dropout(x)
         return x
 
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        with trace_region("BLOCK_LN1"):
+            self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        with trace_region("BLOCK_ATTENTION"):
+            self.attn = CausalSelfAttention(config)
+        with trace_region("BLOCK_LN2"):
+            self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        with trace_region("BLOCK_MLP"):
+            self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        with trace_region("BLOCK_RESIDUAL1"):
+            x = x + self.attn(self.ln_1(x))
+        with trace_region("BLOCK_RESIDUAL2"):
+            x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -174,21 +220,29 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+        with trace_region("GPT_TOKEN_EMBED"):
+            tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        with trace_region("GPT_POSITION_EMBED"):
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        with trace_region("GPT_EMBED_ADD_DROPOUT"):
+            x = self.transformer.drop(tok_emb + pos_emb)
+        with trace_region("GPT_BLOCKS"):
+            for layer_id, block in enumerate(self.transformer.h):
+                with trace_region(f"LAYER_{layer_id:02d}"):
+                    x = block(x)
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+        with trace_region("GPT_FINAL_LN"):
+            x = self.transformer.ln_f(x)
+
+        with trace_region("GPT_LM_HEAD"):
+            if targets is not None:
+                # if we are given some desired targets also calculate the loss
+                logits = self.lm_head(x)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            else:
+                # inference-time mini-optimization: only forward the lm_head on the very last position
+                logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+                loss = None
 
         return logits, loss
 
@@ -313,9 +367,11 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            with trace_region("GEN_NO_CACHE_FORWARD"):
+                logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
+            with trace_region("GEN_SAMPLE"):
+                logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -325,6 +381,8 @@ class GPT(nn.Module):
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+
+            with trace_region("GEN_APPEND_TOKEN"):
+                idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
