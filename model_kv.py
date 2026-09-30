@@ -285,7 +285,7 @@ class GPT(nn.Module):
             for i, block in enumerate(self.transformer.h):
                 with trace_region(f"LAYER_{i:02d}"):
                     layer_cache = kv_cache[i] if kv_cache is not None else None
-                    x = block(x, layer_cache, cache_index)
+                    x = block(x, layer = i, kv_cache=layer_cache, cache_index=cache_index)
         with trace_region("GPT_FINAL_LN"):
             x = self.transformer.ln_f(x)
         # print("12 layer 통과 후: ", x.shape)
