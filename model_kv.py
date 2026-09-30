@@ -226,7 +226,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -485,7 +485,7 @@ class GPT(nn.Module):
                     idx = torch.cat((idx, idx_next), dim=1)
 
                 if i < max_new_tokens - 1:
-                    with trace_region("GEN_DECODE_STEP"):
+                    with trace_region(f"GEN_DECODE_STEP_{i:03d}"):
                         logits, _ = self(idx_next, kv_cache=kv, cache_index=ci)
                     ci += 1
         return idx
