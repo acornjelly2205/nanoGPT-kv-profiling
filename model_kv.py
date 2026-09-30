@@ -33,6 +33,25 @@ def trace_region(name):
         yield
 
 
+@contextmanager
+def trace_mode(trace_torch=None, trace_nvtx=None):
+    global TRACE_TORCH, TRACE_NVTX
+
+    old_torch = TRACE_TORCH
+    old_nvtx = TRACE_NVTX
+
+    if trace_torch is not None:
+        TRACE_TORCH = trace_torch
+
+    if trace_nvtx is not None:
+        TRACE_NVTX = trace_nvtx
+
+    try:
+        yield
+    finally:
+        TRACE_TORCH = old_torch
+        TRACE_NVTX = old_nvtx
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -416,42 +435,44 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate_lab(self, idx, max_new_tokens, temperature=1.0, top_k=None,
-                    cache_len=None, greedy_fastpath=False):
+                    cache_len=None, greedy_fastpath=False, trace_torhch=None, trace_nvtx=None):
         """model.py를 건드리지 않는 측정용 드라이버. 원본 generate와 다른 점:
         마지막 반복의 forward 생략 / zeros->empty / dtype 추론 / 스위치 2개."""
-        cfg = self.config
-        b, t0 = idx.size()
-        need = t0 + max_new_tokens
-        assert need <= cfg.block_size, f"{need} > block_size({cfg.block_size})"
-    
-        cache_len = cache_len or cfg.block_size
-        assert need <= cache_len <= cfg.block_size
-    
-        kv = torch.empty(cfg.n_layer, 2, b, cfg.n_head, cache_len,
-                        cfg.n_embd // cfg.n_head,
-                        dtype=next(self.parameters()).dtype, device=idx.device)
 
-        with trace_region("GEN_PREFILL"):
-            logits, _ = self(idx, kv_cache=kv, cache_index=0)
-        ci = t0
-        for i in range(max_new_tokens):
-            with trace_region("GEN_SAMPLE"):
-                last = logits[:, -1, :]
-                if greedy_fastpath and top_k == 1:
-                    idx_next = last.argmax(dim=-1, keepdim=True)      # 커널 1개
-                else:
-                    last = last / temperature
-                    if top_k is not None:
-                        v, _ = torch.topk(last, min(top_k, last.size(-1)))
-                        last = last.masked_fill(last < v[:, [-1]], -float('Inf'))
-                    idx_next = torch.multinomial(F.softmax(last, dim=-1), num_samples=1)
-            
-            with trace_region("GEN_APPEND_TOKEN"):
-               idx = torch.cat((idx, idx_next), dim=1)
+        with trace_mode(trace_torhch, trace_nvtx):
+            cfg = self.config
+            b, t0 = idx.size()
+            need = t0 + max_new_tokens
+            assert need <= cfg.block_size, f"{need} > block_size({cfg.block_size})"
+        
+            cache_len = cache_len or cfg.block_size
+            assert need <= cache_len <= cfg.block_size
+        
+            kv = torch.empty(cfg.n_layer, 2, b, cfg.n_head, cache_len,
+                            cfg.n_embd // cfg.n_head,
+                            dtype=next(self.parameters()).dtype, device=idx.device)
 
-            if i < max_new_tokens - 1:
-                with trace_region("GEN_DECODE_STEP"):
-                    logits, _ = self(idx_next, kv_cache=kv, cache_index=ci)
-                ci += 1
+            with trace_region("GEN_PREFILL"):
+                logits, _ = self(idx, kv_cache=kv, cache_index=0)
+            ci = t0
+            for i in range(max_new_tokens):
+                with trace_region("GEN_SAMPLE"):
+                    last = logits[:, -1, :]
+                    if greedy_fastpath and top_k == 1:
+                        idx_next = last.argmax(dim=-1, keepdim=True)      # 커널 1개
+                    else:
+                        last = last / temperature
+                        if top_k is not None:
+                            v, _ = torch.topk(last, min(top_k, last.size(-1)))
+                            last = last.masked_fill(last < v[:, [-1]], -float('Inf'))
+                        idx_next = torch.multinomial(F.softmax(last, dim=-1), num_samples=1)
+                
+                with trace_region("GEN_APPEND_TOKEN"):
+                    idx = torch.cat((idx, idx_next), dim=1)
+
+                if i < max_new_tokens - 1:
+                    with trace_region("GEN_DECODE_STEP"):
+                        logits, _ = self(idx_next, kv_cache=kv, cache_index=ci)
+                    ci += 1
         return idx
  
