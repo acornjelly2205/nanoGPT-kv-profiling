@@ -400,7 +400,7 @@ class GPT(nn.Module):
                 # if the sequence context is growing too long we must crop it at block_size
                 idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
                 # forward the model to get the logits for the index in the sequence
-                with trace_region(f"GEN_NO_CACHE_FORWARD_{step:02d}"):
+                with trace_region(f"GEN_NO_CACHE_FORWARD_{step:03d}"):
                     logits, _ = self(idx_cond)
                 # pluck the logits at the final step and scale by desired temperature
                 with trace_region("GEN_SAMPLE"):
